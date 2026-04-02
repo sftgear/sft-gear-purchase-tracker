@@ -46,7 +46,8 @@ function httpsPost(hostname, path, payload) {
 async function getRecentOrders() {
   // Pull orders from the last 15 minutes with a wider window to avoid gaps
   const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-  const url = `https://api.squarespace.com/1.0/commerce/orders?modifiedAfter=${since}`;
+  const now = new Date().toISOString();
+  const url = `https://api.squarespace.com/1.0/commerce/orders?modifiedAfter=${since}&modifiedBefore=${now}`;
 
   console.log("Fetching orders since:", since);
 
