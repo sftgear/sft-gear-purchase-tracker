@@ -9,7 +9,7 @@ function httpsGet(url, headers) {
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
         try {
-          resolve(JSON.parse(data));
+          resolve({ status: res.statusCode, body: JSON.parse(data) });
         } catch (e) {
           reject(new Error("Failed to parse response: " + data));
         }
@@ -44,16 +44,27 @@ function httpsPost(hostname, path, payload) {
 // ─── Squarespace ─────────────────────────────────────────────────────────────
 
 async function getRecentOrders() {
-  // Pull orders from the last 10 minutes to ensure we don't miss any
-  const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-  const url = `https://api.squarespace.com/1.0/commerce/orders?modifiedAfter=${since}&fulfillmentStatus=FULFILLED,PENDING`;
+  // Pull orders from the last 15 minutes with a wider window to avoid gaps
+  const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const url = `https://api.squarespace.com/1.0/commerce/orders?modifiedAfter=${since}`;
 
-  const data = await httpsGet(url, {
+  console.log("Fetching orders since:", since);
+
+  const result = await httpsGet(url, {
     Authorization: `Bearer ${process.env.SQUARESPACE_API_KEY}`,
     "User-Agent": "SFTGear-GA4-Tracker/1.0",
   });
 
-  return data.result || [];
+  console.log("Squarespace API status:", result.status);
+  console.log("Squarespace API response:", JSON.stringify(result.body));
+
+  if (result.status !== 200) {
+    throw new Error(`Squarespace API error: ${result.status} - ${JSON.stringify(result.body)}`);
+  }
+
+  const orders = result.body.result || [];
+  console.log(`Found ${orders.length} orders`);
+  return orders;
 }
 
 // ─── GA4 Measurement Protocol ────────────────────────────────────────────────
@@ -62,7 +73,6 @@ async function sendPurchaseEvent(order) {
   const measurementId = process.env.GA4_MEASUREMENT_ID;
   const apiSecret = process.env.GA4_API_SECRET;
 
-  // Build items array from Squarespace line items
   const items = (order.lineItems || []).map((item, index) => ({
     item_id: item.variantId || item.productId || `item_${index}`,
     item_name: item.productName || "Unknown Product",
@@ -75,7 +85,7 @@ async function sendPurchaseEvent(order) {
   const shipping = parseFloat(order.shippingTotal?.value || 0);
 
   const payload = {
-    client_id: order.customerEmail || order.id, // best available client identifier
+    client_id: order.customerEmail || order.id,
     events: [
       {
         name: "purchase",
@@ -91,20 +101,14 @@ async function sendPurchaseEvent(order) {
     ],
   };
 
-  const path = `/mp/collect?measurement_id=${measurementId}&api_secret=${apiSecret}`;
+  console.log("Sending to GA4:", JSON.stringify(payload));
 
+  const path = `/mp/collect?measurement_id=${measurementId}&api_secret=${apiSecret}`;
   const result = await httpsPost("www.google-analytics.com", path, payload);
+
+  console.log("GA4 response status:", result.status);
   return result;
 }
-
-// ─── Deduplication ───────────────────────────────────────────────────────────
-// Netlify functions are stateless, so we use a simple in-memory set per
-// execution. For a low-volume store this is sufficient — the 10-minute
-// lookback window combined with order status filtering prevents most duplicates.
-// If you see duplicate events in GA4, the order status filter below is the
-// first thing to tighten.
-
-const processedOrders = new Set();
 
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
@@ -113,6 +117,7 @@ exports.handler = async function (event, context) {
     const orders = await getRecentOrders();
 
     if (orders.length === 0) {
+      console.log("No recent orders found");
       return {
         statusCode: 200,
         body: JSON.stringify({ message: "No recent orders found" }),
@@ -122,32 +127,28 @@ exports.handler = async function (event, context) {
     const results = [];
 
     for (const order of orders) {
-      // Skip if already processed in this execution
-      if (processedOrders.has(order.id)) {
-        results.push({ orderId: order.id, status: "skipped - duplicate" });
-        continue;
-      }
+      console.log(`Processing order: ${order.orderNumber} | status: ${order.fulfillmentStatus} | total: ${order.grandTotal?.value}`);
 
-      // Only process orders that are confirmed/pending fulfillment
-      // This filters out cancelled or refunded orders
-      const validStatuses = ["PENDING", "FULFILLED"];
-      if (!validStatuses.includes(order.fulfillmentStatus)) {
-        results.push({ orderId: order.id, status: "skipped - invalid status" });
+      // Skip cancelled or refunded orders only
+      const skipStatuses = ["CANCELED", "REFUNDED"];
+      if (skipStatuses.includes(order.fulfillmentStatus)) {
+        console.log(`Skipping order ${order.orderNumber} - status: ${order.fulfillmentStatus}`);
+        results.push({ orderId: order.id, status: "skipped - " + order.fulfillmentStatus });
         continue;
       }
 
       const ga4Result = await sendPurchaseEvent(order);
-      processedOrders.add(order.id);
 
       results.push({
         orderId: order.id,
         orderNumber: order.orderNumber,
         revenue: order.grandTotal?.value,
+        fulfillmentStatus: order.fulfillmentStatus,
         ga4Status: ga4Result.status,
       });
     }
 
-    console.log("Purchase tracking results:", JSON.stringify(results));
+    console.log("Final results:", JSON.stringify(results));
 
     return {
       statusCode: 200,
