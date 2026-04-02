@@ -1,4 +1,5 @@
 const https = require("https");
+const { getStore } = require("@netlify/blobs");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -44,7 +45,6 @@ function httpsPost(hostname, path, payload) {
 // ─── Squarespace ─────────────────────────────────────────────────────────────
 
 async function getRecentOrders() {
-  // Pull orders from the last 15 minutes with a wider window to avoid gaps
   const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
   const now = new Date().toISOString();
   const url = `https://api.squarespace.com/1.0/commerce/orders?modifiedAfter=${since}&modifiedBefore=${now}`;
@@ -57,7 +57,6 @@ async function getRecentOrders() {
   });
 
   console.log("Squarespace API status:", result.status);
-  console.log("Squarespace API response:", JSON.stringify(result.body));
 
   if (result.status !== 200) {
     throw new Error(`Squarespace API error: ${result.status} - ${JSON.stringify(result.body)}`);
@@ -85,6 +84,12 @@ async function sendPurchaseEvent(order) {
   const tax = parseFloat(order.taxTotal?.value || 0);
   const shipping = parseFloat(order.shippingTotal?.value || 0);
 
+  // Skip test orders from being sent to GA4
+  if (order.testmode) {
+    console.log(`Skipping test order ${order.orderNumber}`);
+    return { status: "skipped - test order" };
+  }
+
   const payload = {
     client_id: order.customerEmail || order.id,
     events: [
@@ -102,7 +107,7 @@ async function sendPurchaseEvent(order) {
     ],
   };
 
-  console.log("Sending to GA4:", JSON.stringify(payload));
+  console.log(`Sending purchase to GA4: order ${order.orderNumber}, total $${revenue}`);
 
   const path = `/mp/collect?measurement_id=${measurementId}&api_secret=${apiSecret}`;
   const result = await httpsPost("www.google-analytics.com", path, payload);
@@ -115,6 +120,9 @@ async function sendPurchaseEvent(order) {
 
 exports.handler = async function (event, context) {
   try {
+    // Initialize blob store for deduplication
+    const store = getStore("processed-orders");
+
     const orders = await getRecentOrders();
 
     if (orders.length === 0) {
@@ -130,7 +138,15 @@ exports.handler = async function (event, context) {
     for (const order of orders) {
       console.log(`Processing order: ${order.orderNumber} | status: ${order.fulfillmentStatus} | total: ${order.grandTotal?.value}`);
 
-      // Skip cancelled or refunded orders only
+      // Check if already processed
+      const alreadyProcessed = await store.get(order.id);
+      if (alreadyProcessed) {
+        console.log(`Skipping order ${order.orderNumber} - already sent to GA4`);
+        results.push({ orderId: order.id, orderNumber: order.orderNumber, status: "skipped - already processed" });
+        continue;
+      }
+
+      // Skip cancelled or refunded orders
       const skipStatuses = ["CANCELED", "REFUNDED"];
       if (skipStatuses.includes(order.fulfillmentStatus)) {
         console.log(`Skipping order ${order.orderNumber} - status: ${order.fulfillmentStatus}`);
@@ -139,6 +155,10 @@ exports.handler = async function (event, context) {
       }
 
       const ga4Result = await sendPurchaseEvent(order);
+
+      // Mark as processed so we don't send it again
+      // Store for 7 days to cover any edge cases
+      await store.set(order.id, order.orderNumber.toString(), { ttl: 60 * 60 * 24 * 7 });
 
       results.push({
         orderId: order.id,
