@@ -1,0 +1,8 @@
+{
+  "name": "sft-gear-purchase-tracker",
+  "version": "1.0.0",
+  "description": "Polls Squarespace orders and sends purchase events to GA4 via Measurement Protocol",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
